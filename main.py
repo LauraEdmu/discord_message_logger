@@ -24,7 +24,7 @@ class LogLevel(StrEnum): # for bot event logging criticality
     CRITICAL = "critical"
 
 
-# required pip installs: pip install discord rich asyncpg dotenv httpx
+# required pip installs: pip install discord rich asyncpg dotenv httpx asyncio
 
 
 load_dotenv()
@@ -51,6 +51,10 @@ class MyClient(discord.Client):
 
     message_buffer: list[tuple[int, int, int, int | None, str]]
     message_buffer_lock: asyncio.Lock
+
+    user_buffer: dict[int, tuple[int, str, str | None, bool]]
+    user_buffer_lock: asyncio.Lock
+
     flush_task: asyncio.Task | None = None
 
     async def setup_hook(self):
@@ -63,11 +67,15 @@ class MyClient(discord.Client):
 
         self.message_buffer = []
         self.message_buffer_lock = asyncio.Lock()
+
+        self.user_buffer = {}
+        self.user_buffer_lock = asyncio.Lock()
+
         self.flush_task = asyncio.create_task(message_flush_loop())
 
     async def close(self):
         try:
-            await flush_message_buffer()
+            await flush_buffers()
         finally:
             await super().close()
 
@@ -90,27 +98,47 @@ file_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
 
-async def flush_message_buffer():
+async def flush_buffers():
+    async with client.user_buffer_lock:
+        user_rows = list(client.user_buffer.values())
+        client.user_buffer.clear()
+
     async with client.message_buffer_lock:
-        if not client.message_buffer:
+        if not client.message_buffer and not user_rows:
             return
 
-        rows = client.message_buffer[:]
+        message_rows = client.message_buffer[:]
         client.message_buffer.clear()
 
     try:
         async with client.db_pool.acquire() as conn:
-            await conn.executemany("""
-                INSERT INTO messages (id, user_id, channel_id, guild_id, content)
-                VALUES ($1, $2, $3, $4, $5)
-                ON CONFLICT (id) DO NOTHING
-            """, rows)
-    except Exception as e:
-        logger.error(f"Error flushing message buffer: {e}", exc_info=True)
+            async with conn.transaction():
+                if user_rows:
+                    await conn.executemany("""
+                        INSERT INTO users (id, username, global_name, bot)
+                        VALUES ($1, $2, $3, $4)
+                        ON CONFLICT (id) DO UPDATE
+                        SET username = EXCLUDED.username,
+                            global_name = EXCLUDED.global_name,
+                            bot = EXCLUDED.bot
+                    """, user_rows)
 
-        # put rows back so they are not lost
+                if message_rows:
+                    await conn.executemany("""
+                        INSERT INTO messages (id, user_id, channel_id, guild_id, content)
+                        VALUES ($1, $2, $3, $4, $5)
+                        ON CONFLICT (id) DO NOTHING
+                    """, message_rows)
+
+    except Exception as e:
+        logger.error(f"Error flushing buffers: {e}", exc_info=True)
+
+        async with client.user_buffer_lock:
+            for row in user_rows:
+                client.user_buffer[row[0]] = row
+
         async with client.message_buffer_lock:
-            client.message_buffer = rows + client.message_buffer
+            client.message_buffer = message_rows + client.message_buffer
 
 async def message_flush_loop():
     await client.wait_until_ready()
@@ -118,7 +146,7 @@ async def message_flush_loop():
     while not client.is_closed():
         try:
             await asyncio.sleep(FLUSH_INTERVAL)
-            await flush_message_buffer()
+            await flush_buffers()
         except Exception as e:
             logger.error(f"Error in message flush loop: {e}", exc_info=True)
 
@@ -126,63 +154,74 @@ async def message_flush_loop():
 
 async def create_db_tables(pool: asyncpg.Pool):
     async with pool.acquire() as conn:
-        # --- tables ---
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS guilds (
-                id BIGINT PRIMARY KEY,
-                name TEXT NOT NULL,
-                owner_id BIGINT NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
+        async with conn.transaction():
+            # --- tables ---
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS guilds (
+                    id BIGINT PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    owner_id BIGINT NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS messages (
-                id BIGINT PRIMARY KEY,
-                user_id BIGINT NOT NULL,
-                channel_id BIGINT NOT NULL,
-                guild_id BIGINT REFERENCES guilds(id) ON DELETE CASCADE,
-                content TEXT NOT NULL,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id BIGINT PRIMARY KEY,
+                    username TEXT NOT NULL,
+                    global_name TEXT,
+                    bot BOOLEAN NOT NULL,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
-        await conn.execute("""
-            CREATE TABLE IF NOT EXISTS bot_events (
-                id serial PRIMARY KEY,
-                event_type TEXT NOT NULL,
-                criticality TEXT NOT NULL
-                    CHECK (criticality IN ('debug', 'info', 'warning', 'error', 'critical')),
-                description TEXT,
-                timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS messages (
+                    id BIGINT PRIMARY KEY,
+                    user_id BIGINT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                    channel_id BIGINT NOT NULL,
+                    guild_id BIGINT REFERENCES guilds(id) ON DELETE CASCADE,
+                    content TEXT NOT NULL,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
-        # --- indexes ---
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_guild_id
-            ON messages(guild_id)
-        """)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS bot_events (
+                    id SERIAL PRIMARY KEY,
+                    event_type TEXT NOT NULL,
+                    criticality TEXT NOT NULL
+                        CHECK (criticality IN ('debug', 'info', 'warning', 'error', 'critical')),
+                    description TEXT,
+                    timestamp TIMESTAMPTZ NOT NULL DEFAULT NOW()
+                )
+            """)
 
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_timestamp
-            ON messages(timestamp)
-        """)
+            # --- indexes ---
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_guild_id
+                ON messages(guild_id)
+            """)
 
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_user_id
-            ON messages(user_id)
-        """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_timestamp
+                ON messages(timestamp)
+            """)
 
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_messages_channel_id
-            ON messages(channel_id)
-        """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_user_id
+                ON messages(user_id)
+            """)
 
-        await conn.execute("""
-            CREATE INDEX IF NOT EXISTS idx_bot_events_timestamp
-            ON bot_events(timestamp)
-        """)
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_messages_channel_id
+                ON messages(channel_id)
+            """)
+
+            await conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_bot_events_timestamp
+                ON bot_events(timestamp)
+            """)
 
 @client.event
 async def on_ready():
@@ -221,6 +260,31 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Error logging guild info: {e}", exc_info=True)
 
+    try:
+        async with client.db_pool.acquire() as conn:
+            user_rows: dict[int, tuple[int, str, str | None, bool]] = {}
+
+            for guild in client.guilds:
+                for member in guild.members:
+                    user_rows[member.id] = (
+                        member.id,
+                        member.name,
+                        member.global_name,
+                        member.bot,
+                    )
+
+            if user_rows:
+                await conn.executemany("""
+                    INSERT INTO users (id, username, global_name, bot)
+                    VALUES ($1, $2, $3, $4)
+                    ON CONFLICT (id) DO UPDATE
+                    SET username = EXCLUDED.username,
+                        global_name = EXCLUDED.global_name,
+                        bot = EXCLUDED.bot
+                """, list(user_rows.values()))
+    except Exception as e:
+        logger.error(f"Error logging startup user info: {e}", exc_info=True)
+
     logger.debug("Got to end of on_ready")
 
 @client.event
@@ -244,7 +308,14 @@ async def on_message(message: discord.Message):
     if message.author == client.user:
         return
 
-    row = (
+    user_row = (
+        message.author.id,
+        message.author.name,
+        getattr(message.author, "global_name", None),
+        message.author.bot,
+    )
+
+    message_row = (
         message.id,
         message.author.id,
         message.channel.id,
@@ -255,16 +326,19 @@ async def on_message(message: discord.Message):
     try:
         should_flush = False
 
+        async with client.user_buffer_lock:
+            client.user_buffer[message.author.id] = user_row
+
         async with client.message_buffer_lock:
-            client.message_buffer.append(row)
+            client.message_buffer.append(message_row)
             if len(client.message_buffer) >= BATCH_SIZE:
                 should_flush = True
 
         if should_flush:
-            await flush_message_buffer()
+            await flush_buffers()
 
     except Exception as e:
-        logger.error(f"Error buffering message: {e}", exc_info=True)
+        logger.error(f"Error buffering message/user: {e}", exc_info=True)
 
 @client.event
 async def on_voice_state_update(
