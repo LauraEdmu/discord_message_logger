@@ -11,6 +11,10 @@ from dotenv import load_dotenv
 import asyncpg
 from enum import StrEnum
 import io
+import asyncio
+
+BATCH_SIZE = 100
+FLUSH_INTERVAL = 1.0
 
 class LogLevel(StrEnum): # for bot event logging criticality
     DEBUG = "debug"
@@ -20,7 +24,7 @@ class LogLevel(StrEnum): # for bot event logging criticality
     CRITICAL = "critical"
 
 
-# required pip installs: pip install discord dotenv aiofiles rich asyncpg httpx
+# required pip installs: pip install discord rich asyncpg dotenv httpx
 
 
 load_dotenv()
@@ -39,10 +43,15 @@ needed_intents.message_content = True
 needed_intents.members = True
 # client = discord.Client(intents=needed_intents)
 # tree = app_commands.CommandTree(client)
+
 class MyClient(discord.Client):
     db_pool: asyncpg.Pool
     startup_done: bool = False
     start_time: datetime_dt
+
+    message_buffer: list[tuple[int, int, int, int | None, str]]
+    message_buffer_lock: asyncio.Lock
+    flush_task: asyncio.Task | None = None
 
     async def setup_hook(self):
         self.db_pool = await asyncpg.create_pool(
@@ -51,6 +60,16 @@ class MyClient(discord.Client):
             max_size=10
         )
         await create_db_tables(self.db_pool)
+
+        self.message_buffer = []
+        self.message_buffer_lock = asyncio.Lock()
+        self.flush_task = asyncio.create_task(message_flush_loop())
+
+    async def close(self):
+        try:
+            await flush_message_buffer()
+        finally:
+            await super().close()
 
 client = MyClient(intents=needed_intents)
 tree = app_commands.CommandTree(client)
@@ -70,6 +89,38 @@ console_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
+
+async def flush_message_buffer():
+    async with client.message_buffer_lock:
+        if not client.message_buffer:
+            return
+
+        rows = client.message_buffer[:]
+        client.message_buffer.clear()
+
+    try:
+        async with client.db_pool.acquire() as conn:
+            await conn.executemany("""
+                INSERT INTO messages (id, user_id, channel_id, guild_id, content)
+                VALUES ($1, $2, $3, $4, $5)
+                ON CONFLICT (id) DO NOTHING
+            """, rows)
+    except Exception as e:
+        logger.error(f"Error flushing message buffer: {e}", exc_info=True)
+
+        # put rows back so they are not lost
+        async with client.message_buffer_lock:
+            client.message_buffer = rows + client.message_buffer
+
+async def message_flush_loop():
+    await client.wait_until_ready()
+
+    while not client.is_closed():
+        try:
+            await asyncio.sleep(FLUSH_INTERVAL)
+            await flush_message_buffer()
+        except Exception as e:
+            logger.error(f"Error in message flush loop: {e}", exc_info=True)
 
 # log severities are: debug, info, warning, error, critical
 
@@ -193,16 +244,27 @@ async def on_message(message: discord.Message):
     if message.author == client.user:
         return
 
+    row = (
+        message.id,
+        message.author.id,
+        message.channel.id,
+        message.guild.id if message.guild else None,
+        message.content,
+    )
+
     try:
-        async with client.db_pool.acquire() as conn:
-            await conn.execute("""
-                INSERT INTO messages (id, user_id, channel_id, guild_id, content)
-                VALUES ($1, $2, $3, $4, $5)
-            """, message.id, message.author.id, message.channel.id,
-                 message.guild.id if message.guild else None,
-                 message.content)
+        should_flush = False
+
+        async with client.message_buffer_lock:
+            client.message_buffer.append(row)
+            if len(client.message_buffer) >= BATCH_SIZE:
+                should_flush = True
+
+        if should_flush:
+            await flush_message_buffer()
+
     except Exception as e:
-        logger.error(f"Error logging message: {e}", exc_info=True)
+        logger.error(f"Error buffering message: {e}", exc_info=True)
 
 @client.event
 async def on_voice_state_update(
