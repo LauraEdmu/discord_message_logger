@@ -347,7 +347,7 @@ async def on_member_join(member: discord.Member): # log new user info to db when
                 SET username = EXCLUDED.username,
                     global_name = EXCLUDED.global_name,
                     bot = EXCLUDED.bot
-            """, user_row)
+            """, *user_row)
     except Exception as e:
         logger.error(f"Error logging new member info: {e}", exc_info=True)
     
@@ -442,6 +442,20 @@ async def unban_user(interaction: discord.Interaction, user: discord.User):
 @client.event
 async def on_message(message: discord.Message):
     if message.author == client.user:
+        return
+    
+    if message.author.id in banned_users:
+        # delete the message and ban the user from the server if they are in the banned_users set
+        try:
+            await message.delete()
+            logger.info(f"Deleted message from {message.author.name} due to being in banned_users list.")
+            if message.guild is not None:
+                await message.guild.ban(message.author, reason="User is banned", delete_message_seconds=3600)
+            logger.info(f"Banned user {message.author.name} due to being in banned_users list.")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to delete message from {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
         return
 
     user_row = (
@@ -550,26 +564,18 @@ async def russian_roulette(interaction: discord.Interaction):
         try:
             await interaction.user.timeout(TIMEOUT_DURATION, reason="Russian Roulette")
             await interaction.response.send_message(
-                f"You got the unlucky outcome and have been timed out for {TIMEOUT_DURATION} minutes!",
-                ephemeral=True,
-            )
+                f"You got the unlucky outcome and have been timed out for {TIMEOUT_DURATION} minutes!")
         except discord.Forbidden as e:
             logger.error(f'Failed to timeout user {interaction.user.name} in russian roulette. E: {e}')
             await interaction.response.send_message(
-                "You got the unlucky outcome but I don't have permission to time you out.",
-                ephemeral=True,
-            )
+                "You got the unlucky outcome but I don't have permission to time you out.")
         except Exception as e:
             logger.critical(e)
             await interaction.response.send_message(
-                "An error occurred while trying to time you out for losing at Russian Roulette.",
-                ephemeral=True,
-            )
+                "An error occurred while trying to time you out for losing at Russian Roulette.")
     else:
         await interaction.response.send_message(
-            "Congratulations, you won at Russian Roulette and are safe!",
-            ephemeral=True,
-        )
+            "Congratulations, you won at Russian Roulette and are safe!")
 
 @tree.command(name="echo")
 async def echomode(
