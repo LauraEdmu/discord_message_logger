@@ -12,6 +12,8 @@ import asyncpg
 from enum import StrEnum
 import io
 import asyncio
+import random
+import json
 
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
@@ -233,10 +235,25 @@ async def on_ready():
 
     await tree.sync()
 
+    # load short jokes csv
+    with open("shortjokes.csv", newline="", encoding="utf-8") as csvfile:
+        import csv
+        global jokes
+        reader = csv.DictReader(csvfile) 
+        jokes = [row["Joke"] for row in reader if row["Joke"]]
+
     await client.change_presence(
         status=discord.Status.online,
         activity=discord.Game("Status!")
     )
+
+    # load banned_users.json (contains a set of user IDs that are banned from using the bot, which is checked in the on_message event and join event) into a global set variable
+    if os.path.exists("banned_users.json"):
+        with open("banned_users.json", "r") as f:
+            global banned_users
+            banned_users = set(json.load(f))
+    else:
+        banned_users = set()
 
     try:
         async with client.db_pool.acquire() as conn:
@@ -288,7 +305,7 @@ async def on_ready():
     logger.debug("Got to end of on_ready")
 
 @client.event
-async def on_guild_join(guild: discord.Guild):
+async def on_guild_join(guild: discord.Guild): # log new guild info to db when bot is added to a new server
     try:
         async with client.db_pool.acquire() as conn:
             await conn.execute("""
@@ -301,6 +318,125 @@ async def on_guild_join(guild: discord.Guild):
     except Exception as e:
         logger.error(f"Error logging joined guild info: {e}", exc_info=True)
 
+@client.event
+async def on_member_join(member: discord.Member): # log new user info to db when a new user joins a server the bot is in
+    if member.id in banned_users:
+        # ban the user from the server if they are in the banned_users set
+        try:
+            await member.ban(reason="User is banned",delete_message_seconds=3600)
+            logger.info(f"Banned user {member.name} on join due to being in banned_users list.")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to ban user {member.name} on join. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+        return
+    
+    user_row = (
+        member.id,
+        member.name,
+        getattr(member, "global_name", None),
+        member.bot,
+    )
+
+    try:
+        async with client.db_pool.acquire() as conn:
+            await conn.execute("""
+                INSERT INTO users (id, username, global_name, bot)
+                VALUES ($1, $2, $3, $4)
+                ON CONFLICT (id) DO UPDATE
+                SET username = EXCLUDED.username,
+                    global_name = EXCLUDED.global_name,
+                    bot = EXCLUDED.bot
+            """, user_row)
+    except Exception as e:
+        logger.error(f"Error logging new member info: {e}", exc_info=True)
+    
+    try:
+        await member.send(fr"Welcome to the server, {member.display_name}!")
+
+        logger.debug(f"Send onboarding message to {member.display_name}")
+    except discord.Forbidden as e:
+        logger.error(f'Failed to message {member.name} on join. E: {e}')
+    except Exception as e:
+        logger.critical(e)
+
+    guild = member.guild
+    role = guild.get_role(1508144612370419835) # role ID for "Apprentices" role, which is given to new members on join
+    logger.debug(f"Member {member.name} joined")
+    
+    if role:
+        try:
+            await member.add_roles(role)
+            logger.info(f'Assigned {role.name} role to {member.name}')
+            print(f'Assigned {role.name} role to {member.name}')
+        except discord.Forbidden as e:
+            logger.error(f'Failed to assign {role.name} role to {member.name}. E: {e}')
+            print(f'Failed to assign {role.name} role to {member.name}')
+
+@tree.command(name="ban")
+async def ban_user(interaction: discord.Interaction, user: discord.User):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+    
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to ban users.",
+            ephemeral=True,
+        )
+        return
+
+
+    banned_users.add(user.id)
+    with open("banned_users.json", "w") as f:
+        json.dump(list(banned_users), f)
+    
+    try:
+        await interaction.guild.ban(user, reason="User is banned", delete_message_seconds=3600)
+        logger.info(f"Banned user {user.name} via command and added to banned_users list.")
+        await interaction.response.send_message(f"User {user.name} has been banned.", ephemeral=True)
+    except discord.Forbidden as e:
+        logger.error(f'Failed to ban user {user.name} via command. E: {e}')
+        await interaction.response.send_message(f"Failed to ban user {user.name} due to permissions.", ephemeral=True)
+    except Exception as e:
+        logger.critical(e)
+        await interaction.response.send_message(f"An error occurred while trying to ban user {user.name}.", ephemeral=True)
+
+@tree.command(name="unban")
+async def unban_user(interaction: discord.Interaction, user: discord.User):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+    
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to unban users.",
+            ephemeral=True,
+        )
+        return
+    
+    if user.id in banned_users:
+        banned_users.remove(user.id)
+        with open("banned_users.json", "w") as f:
+            json.dump(list(banned_users), f)
+ 
+    try:
+        await interaction.guild.unban(user, reason="User is unbanned")
+        logger.info(f"Unbanned user {user.name} via command and removed from banned_users list.")
+        await interaction.response.send_message(f"User {user.name} has been unbanned.", ephemeral=True)
+    except discord.Forbidden as e:
+        logger.error(f'Failed to unban user {user.name} via command. E: {e}')
+        await interaction.response.send_message(f"Failed to unban user {user.name} due to permissions.", ephemeral=True)
+    except Exception as e:
+        logger.critical(e)
+        await interaction.response.send_message(f"An error occurred while trying to unban user {user.name}.", ephemeral=True)
+    
 
 
 @client.event
@@ -350,6 +486,7 @@ async def on_voice_state_update(
         return
 
     target_user_id = 288219032178393092
+    # target_user_id = 262687596642041856
 
     # Only fire when the user was not in voice before, and is now in voice
     if member.id != target_user_id:
@@ -385,6 +522,54 @@ SENDABLE_CHANNEL_TYPES = (
     discord.TextChannel,
     discord.Thread,
 )
+
+@tree.command(name="russianroulette", description="1/6 chance to get a timeout")
+async def russian_roulette(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+    
+    if not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message(
+            "Could not verify your server permissions.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.channel, SENDABLE_CHANNEL_TYPES):
+        await interaction.response.send_message(
+            "This channel type does not support sending messages like that.",
+            ephemeral=True,
+        )
+        return
+
+    if random.randint(1, 6) == 1:
+        try:
+            await interaction.user.timeout(TIMEOUT_DURATION, reason="Russian Roulette")
+            await interaction.response.send_message(
+                f"You got the unlucky outcome and have been timed out for {TIMEOUT_DURATION} minutes!",
+                ephemeral=True,
+            )
+        except discord.Forbidden as e:
+            logger.error(f'Failed to timeout user {interaction.user.name} in russian roulette. E: {e}')
+            await interaction.response.send_message(
+                "You got the unlucky outcome but I don't have permission to time you out.",
+                ephemeral=True,
+            )
+        except Exception as e:
+            logger.critical(e)
+            await interaction.response.send_message(
+                "An error occurred while trying to time you out for losing at Russian Roulette.",
+                ephemeral=True,
+            )
+    else:
+        await interaction.response.send_message(
+            "Congratulations, you won at Russian Roulette and are safe!",
+            ephemeral=True,
+        )
 
 @tree.command(name="echo")
 async def echomode(

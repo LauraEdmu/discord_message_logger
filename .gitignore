@@ -2,3 +2,7 @@ keys/
 *.env
 .venv/
 __pycache__/
+*remote*
+*.csv
+*.json
+close_discord.py
