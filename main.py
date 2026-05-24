@@ -14,6 +14,7 @@ import io
 import asyncio
 import random
 import json
+import re
 
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
@@ -37,8 +38,12 @@ install(show_locals=True) # Enable rich traceback
 
 DEV_ID = 262687596642041856
 
-default_duration = 60
+default_duration = 15
 TIMEOUT_DURATION = timedelta(minutes=default_duration) # for banned word timeout
+GAME_TIMEOUT_DURATION = timedelta(minutes=5) 
+IS_INT_NUMBERS = re.compile(r'^\s*\d+\s*$')
+BANNED_USERS_PATH = os.path.join("banned_stuff", "banned_users.json")
+BANNED_SUBSTRINGS_PATH = os.path.join("banned_stuff", "banned_substrings.json")
 
 needed_intents = discord.Intents.default()
 needed_intents.message_content = True
@@ -50,6 +55,7 @@ class MyClient(discord.Client):
     db_pool: asyncpg.Pool
     startup_done: bool = False
     start_time: datetime_dt
+    web_server_started: bool = False
 
     message_buffer: list[tuple[int, int, int, int | None, str]]
     message_buffer_lock: asyncio.Lock
@@ -234,6 +240,10 @@ async def on_ready():
     client.start_time = datetime_dt.now()
 
     await tree.sync()
+    
+    if not getattr(client, "web_server_started", False):
+        client.web_server_started = True
+        client.loop.create_task(start_web_server())
 
     # load short jokes csv
     with open("shortjokes.csv", newline="", encoding="utf-8") as csvfile:
@@ -248,12 +258,34 @@ async def on_ready():
     )
 
     # load banned_users.json (contains a set of user IDs that are banned from using the bot, which is checked in the on_message event and join event) into a global set variable
-    if os.path.exists("banned_users.json"):
-        with open("banned_users.json", "r") as f:
+    os.makedirs(os.path.dirname(BANNED_USERS_PATH), exist_ok=True)
+    if os.path.exists(BANNED_USERS_PATH):
+        with open(BANNED_USERS_PATH, "r") as f:
             global banned_users
             banned_users = set(json.load(f))
     else:
         banned_users = set()
+    
+    # load banned_substrings.json (contains a list of substrings that are not allowed in messages, which is checked in the on_message event) into a global list variable
+    global banned_substrings_regex
+    global banned_substrings
+    os.makedirs(os.path.dirname(BANNED_SUBSTRINGS_PATH), exist_ok=True)
+    if os.path.exists(BANNED_SUBSTRINGS_PATH):
+        with open(BANNED_SUBSTRINGS_PATH, "r") as f:
+            banned_substrings = json.load(f)
+    else:
+        banned_substrings = []
+      
+    banned_substrings = [
+        sub for sub in banned_substrings
+        if isinstance(sub, str) and sub
+    ]
+
+    banned_substrings_regex = (
+        re.compile("|".join(re.escape(sub) for sub in banned_substrings), re.IGNORECASE)
+        if banned_substrings
+        else None
+    )
 
     try:
         async with client.db_pool.acquire() as conn:
@@ -301,6 +333,10 @@ async def on_ready():
                 """, list(user_rows.values()))
     except Exception as e:
         logger.error(f"Error logging startup user info: {e}", exc_info=True)
+    
+    if not getattr(client, "web_server_started", False):
+        client.web_server_started = True
+        client.loop.create_task(start_web_server())
 
     logger.debug("Got to end of on_ready")
 
@@ -373,6 +409,113 @@ async def on_member_join(member: discord.Member): # log new user info to db when
             logger.error(f'Failed to assign {role.name} role to {member.name}. E: {e}')
             print(f'Failed to assign {role.name} role to {member.name}')
 
+def rebuild_banned_substrings_regex() -> None:
+    global banned_substrings_regex
+
+    cleaned = [
+        sub for sub in banned_substrings
+        if isinstance(sub, str) and sub
+    ]
+
+    banned_substrings_regex = (
+        re.compile("|".join(re.escape(sub) for sub in cleaned), re.IGNORECASE)
+        if cleaned
+        else None
+    )
+
+@tree.command(name="bansubstring")
+async def ban_substring(interaction: discord.Interaction, substring: str):
+    global banned_substrings
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to ban substrings.",
+            ephemeral=True,
+        )
+        return
+
+    substring = substring.strip()
+    if not substring:
+        await interaction.response.send_message(
+            "Cannot ban an empty substring.",
+            ephemeral=True,
+        )
+        return
+
+    banned_substrings_folded = {sub.casefold() for sub in banned_substrings}
+
+    if substring.casefold() in banned_substrings_folded:
+        await interaction.response.send_message(
+            f'"{substring}" is already in the banned substrings list.',
+            ephemeral=True,
+        )
+        return
+
+    banned_substrings.append(substring)
+
+    with open(BANNED_SUBSTRINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(banned_substrings, f, indent=2)
+
+    rebuild_banned_substrings_regex()
+
+    logger.info(f'Added "{substring}" to banned substrings list via command.')
+    await interaction.response.send_message(
+        f'"{substring}" has been added to the banned substrings list.',
+        ephemeral=True,
+    )
+
+@tree.command(name="unbansubstring")
+async def unban_substring(interaction: discord.Interaction, substring: str):
+    global banned_substrings
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to unban substrings.",
+            ephemeral=True,
+        )
+        return
+
+    substring = substring.strip()
+
+    match = next(
+        (sub for sub in banned_substrings if sub.casefold() == substring.casefold()),
+        None,
+    )
+
+    if match is None:
+        await interaction.response.send_message(
+            f'"{substring}" is not in the banned substrings list.',
+            ephemeral=True,
+        )
+        return
+
+    banned_substrings.remove(match)
+
+    with open(BANNED_SUBSTRINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(banned_substrings, f, indent=2)
+
+    rebuild_banned_substrings_regex()
+
+    logger.info(f'Removed "{match}" from banned substrings list via command.')
+    await interaction.response.send_message(
+        f'"{match}" has been removed from the banned substrings list.',
+        ephemeral=True,
+    )
+
 @tree.command(name="ban")
 async def ban_user(interaction: discord.Interaction, user: discord.User):
     if interaction.guild is None:
@@ -391,7 +534,7 @@ async def ban_user(interaction: discord.Interaction, user: discord.User):
 
 
     banned_users.add(user.id)
-    with open("banned_users.json", "w") as f:
+    with open(BANNED_USERS_PATH, "w") as f:
         json.dump(list(banned_users), f)
     
     try:
@@ -423,7 +566,7 @@ async def unban_user(interaction: discord.Interaction, user: discord.User):
     
     if user.id in banned_users:
         banned_users.remove(user.id)
-        with open("banned_users.json", "w") as f:
+        with open(BANNED_USERS_PATH, "w") as f:
             json.dump(list(banned_users), f)
  
     try:
@@ -441,7 +584,7 @@ async def unban_user(interaction: discord.Interaction, user: discord.User):
 
 @client.event
 async def on_message(message: discord.Message):
-    if message.author == client.user:
+    if message.author.bot:
         return
     
     if message.author.id in banned_users:
@@ -451,12 +594,58 @@ async def on_message(message: discord.Message):
             logger.info(f"Deleted message from {message.author.name} due to being in banned_users list.")
             if message.guild is not None:
                 await message.guild.ban(message.author, reason="User is banned", delete_message_seconds=3600)
-            logger.info(f"Banned user {message.author.name} due to being in banned_users list.")
+                logger.info(f"Banned user {message.author.name} due to being in banned_users list.")
         except discord.Forbidden as e:
             logger.error(f'Failed to delete message from {message.author.name}. E: {e}')
         except Exception as e:
             logger.critical(e)
         return
+    
+    if isinstance(message.author, discord.Member) and banned_substrings_regex and banned_substrings_regex.search(message.content):
+        try:
+            await message.delete()
+            logger.info(f"Deleted message from {message.author.name} due to containing a banned substring.")
+            if message.guild is not None:
+                await message.author.timeout(TIMEOUT_DURATION, reason="Message contained a banned substring")
+                logger.info(f"Timed out user {message.author.name} for sending a message with a banned substring.")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to delete message from {message.author.name} or timeout user. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+    
+    ### Counting game
+    if message.channel.id == 1508224353488212050 and IS_INT_NUMBERS.match(message.content):
+        counting_path = os.path.join("games", "counting.json")
+        os.makedirs("games", exist_ok=True)
+        try:
+            with open(counting_path, "r") as f:
+                counting_data = json.load(f)
+        except FileNotFoundError:
+            counting_data = {}
+        
+        count_total, last_counter_id = counting_data.get("count_total", 0), counting_data.get("last_counter_id", None)
+        submitted_number = int(re.sub(r'\D', '', message.content)) # just to validate that the content is an int, since the regex allows for whitespace around it
+        if last_counter_id == message.author.id:
+            await message.add_reaction("🟡")
+            await message.channel.send(f"{message.author.mention} You can't count twice in a row! The count was {count_total} and is still {count_total}.")
+        else:
+            if submitted_number == count_total + 1:
+                count_total += 1
+                counting_data["count_total"] = count_total
+                counting_data["last_counter_id"] = message.author.id
+                with open(counting_path, "w") as f:
+                    json.dump(counting_data, f)
+                await message.add_reaction("✅")
+            else:
+                await message.add_reaction("❌")
+                await message.channel.send(f"{message.author.mention} Your number must be exactly 1 higher than the previous number! The count was {count_total} and is now 0.")
+                counting_data["count_total"] = 0
+                counting_data["last_counter_id"] = None
+                with open(counting_path, "w") as f:
+                    json.dump(counting_data, f)
+
+
+
 
     user_row = (
         message.author.id,
@@ -537,6 +726,13 @@ SENDABLE_CHANNEL_TYPES = (
     discord.Thread,
 )
 
+def ordinal(n: int) -> str:
+    if 10 <= n % 100 <= 20:
+        suffix = "th"
+    else:
+        suffix = {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{suffix}"
+
 @tree.command(name="russianroulette", description="1/6 chance to get a timeout")
 async def russian_roulette(interaction: discord.Interaction):
     if interaction.guild is None:
@@ -559,12 +755,36 @@ async def russian_roulette(interaction: discord.Interaction):
             ephemeral=True,
         )
         return
+    
+    # check if channel id is 1508163397571842098, which is the channel ID for the #bot-stuff channel in the server, and if not, return an error message saying that this command can only be used in the #bot-stuff channel
+    if interaction.channel.id != 1508163397571842098:
+        await interaction.response.send_message(
+            "This command can only be used in the #bot-stuff channel.",
+            ephemeral=True,
+        )
+        return
+    
+    russian_roulette_stats_path = os.path.join("games", "russian_stats.json")
+    os.makedirs("games", exist_ok=True)
+
+    user_id = str(interaction.user.id)
+    try:
+        with open(russian_roulette_stats_path, "r") as f:
+            stats = json.load(f)
+    except FileNotFoundError:
+        stats = {}
+    
+    failures, wins = stats.get(user_id, [0, 0])
 
     if random.randint(1, 6) == 1:
         try:
-            await interaction.user.timeout(TIMEOUT_DURATION, reason="Russian Roulette")
+            failures += 1
+            fail_count = ordinal(failures)
+
+            mins_timed_out = int(GAME_TIMEOUT_DURATION.total_seconds() // 60)
+            await interaction.user.timeout(GAME_TIMEOUT_DURATION, reason="Russian Roulette")
             await interaction.response.send_message(
-                f"You got the unlucky outcome and have been timed out for {TIMEOUT_DURATION} minutes!")
+                f"You got the unlucky outcome and have been timed out for {mins_timed_out} minutes! This is your {fail_count} failure.")
         except discord.Forbidden as e:
             logger.error(f'Failed to timeout user {interaction.user.name} in russian roulette. E: {e}')
             await interaction.response.send_message(
@@ -574,8 +794,16 @@ async def russian_roulette(interaction: discord.Interaction):
             await interaction.response.send_message(
                 "An error occurred while trying to time you out for losing at Russian Roulette.")
     else:
+        wins += 1
+        win_count = ordinal(wins)
+
         await interaction.response.send_message(
-            "Congratulations, you won at Russian Roulette and are safe!")
+            f"Congratulations, you won at Russian Roulette and are safe! This is your {win_count} win.")
+    
+    # save updated stats back to json file
+    stats[user_id] = [failures, wins]
+    with open(russian_roulette_stats_path, "w") as f:
+        json.dump(stats, f)
 
 @tree.command(name="echo")
 async def echomode(
@@ -648,6 +876,54 @@ async def echomode(
             "Something went wrong while sending that.",
             ephemeral=True
         )
+
+from aiohttp import web
+
+DISCORD_LIVE_CHANNEL_ID = int(os.environ["DISCORD_LIVE_CHANNEL_ID"])
+IFTTT_SHARED_SECRET = os.environ["IFTTT_SHARED_SECRET"]
+TWITCH_USERNAME = os.environ["TWITCH_USERNAME"]
+
+
+async def handle_ifttt_live(request: web.Request):
+    secret = request.headers.get("X-Webhook-Secret")
+
+    if secret != IFTTT_SHARED_SECRET:
+        return web.Response(status=403, text="Forbidden")
+
+    data = await request.json()
+
+    category = data.get("category", "Unknown category")
+    url = data.get("url", f"https://twitch.tv/{TWITCH_USERNAME}")
+
+    channel = client.get_channel(DISCORD_LIVE_CHANNEL_ID)
+    if channel is None:
+        channel = await client.fetch_channel(DISCORD_LIVE_CHANNEL_ID)
+    
+    if not isinstance(channel, SENDABLE_CHANNEL_TYPES):
+        logger.error(f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not a text channel or thread.")
+        return web.Response(status=500, text="Channel configuration error")
+
+    await channel.send(
+        f"@everyone\n"
+        f"🔴 **{TWITCH_USERNAME} is live!**\n"
+        f"Playing: {category}\n"
+        f"{url}"
+    )
+
+    return web.Response(text="OK")
+
+
+async def start_web_server():
+    app = web.Application()
+    app.router.add_post("/ifttt/twitch-live", handle_ifttt_live)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", 8070)
+    await site.start()
+
+    print("Webhook server running on port 8070")
 
 if __name__ == '__main__':
     logger.debug("Starting bot")
