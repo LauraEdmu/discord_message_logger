@@ -44,6 +44,39 @@ GAME_TIMEOUT_DURATION = timedelta(minutes=5)
 IS_INT_NUMBERS = re.compile(r'^\s*\d+\s*$')
 BANNED_USERS_PATH = os.path.join("banned_stuff", "banned_users.json")
 BANNED_SUBSTRINGS_PATH = os.path.join("banned_stuff", "banned_substrings.json")
+BANNED_WORDS_PATH = os.path.join("banned_stuff", "banned_words.json")
+BANNED_REGEX_PATH = os.path.join("banned_stuff", "banned_regex.json")
+
+YOUTUBE_SI_REGEX = re.compile(
+    r"youtu\.be/(?P<videoid>[A-Za-z0-9_-]{11})"
+    r"\?"
+    r"(?=[^#\s]*\bsi=(?P<si>[A-Za-z0-9_-]{16}))"
+    r"(?:(?=[^#\s]*\bt=(?P<timestamp>\d+)))?"
+    r"[^#\s]*"
+)
+
+PRONOUNS = [
+    "i", "me", "myself", "mine", "my",
+    "we", "us", "ourselves", "ours", "our",
+    "you", "yourself", "yourselves", "yours", "your",
+    "thou", "thee", "thyself", "thine", "thy",
+    "he", "him", "himself", "his",
+    "she", "her", "herself", "hers",
+    "it", "itself", "its",
+    "they", "them", "themself", "themselves", "theirs", "their",
+    "one", "oneself", "one's",
+    "who", "whom", "whose", "what", "which",
+    "each other", "each other's",
+    "one another", "one another's",
+    "there",
+]
+
+PRONOUN_RE = re.compile(
+    r"(?<!\w)(?:"
+    + "|".join(re.escape(p).replace(r"\ ", r"\s+") for p in sorted(PRONOUNS, key=len, reverse=True))
+    + r")(?!\w)",
+    re.IGNORECASE,
+)
 
 needed_intents = discord.Intents.default()
 needed_intents.message_content = True
@@ -271,7 +304,7 @@ async def on_ready():
     global banned_substrings
     os.makedirs(os.path.dirname(BANNED_SUBSTRINGS_PATH), exist_ok=True)
     if os.path.exists(BANNED_SUBSTRINGS_PATH):
-        with open(BANNED_SUBSTRINGS_PATH, "r") as f:
+        with open(BANNED_SUBSTRINGS_PATH, "r", encoding="utf-8") as f:
             banned_substrings = json.load(f)
     else:
         banned_substrings = []
@@ -284,6 +317,51 @@ async def on_ready():
     banned_substrings_regex = (
         re.compile("|".join(re.escape(sub) for sub in banned_substrings), re.IGNORECASE)
         if banned_substrings
+        else None
+    )
+
+    global banned_words_regex
+    global banned_words
+    os.makedirs(os.path.dirname(BANNED_WORDS_PATH), exist_ok=True)
+    if os.path.exists(BANNED_WORDS_PATH):
+        with open(BANNED_WORDS_PATH, "r", encoding="utf-8") as f:
+            banned_words = json.load(f)
+    else:
+        banned_words = []
+
+    banned_words = [
+        word for word in banned_words
+        if isinstance(word, str) and word
+    ]
+
+    banned_words_regex = (
+        re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(word) for word in banned_words)
+            + r")\b",
+            re.IGNORECASE,
+        )
+        if banned_words
+        else None
+    )
+
+    global banned_regex_regex
+    global banned_regex
+    os.makedirs(os.path.dirname(BANNED_REGEX_PATH), exist_ok=True)
+    if os.path.exists(BANNED_REGEX_PATH):
+        with open(BANNED_REGEX_PATH, "r", encoding="utf-8") as f:
+            banned_regex = json.load(f)
+    else:
+        banned_regex = []
+
+    banned_regex = [
+        regex for regex in banned_regex
+        if isinstance(regex, str) and regex
+    ]
+
+    banned_regex_regex = (
+        re.compile("|".join(banned_regex), re.IGNORECASE)
+        if banned_regex
         else None
     )
 
@@ -516,6 +594,118 @@ async def unban_substring(interaction: discord.Interaction, substring: str):
         ephemeral=True,
     )
 
+def rebuild_banned_words_regex() -> None:
+    global banned_words_regex
+
+    cleaned = [
+        word for word in banned_words
+        if isinstance(word, str) and word
+    ]
+
+    banned_words_regex = (
+        re.compile(
+            r"\b(?:"
+            + "|".join(re.escape(word) for word in cleaned)
+            + r")\b",
+            re.IGNORECASE,
+        )
+        if banned_words
+        else None
+    )
+
+@tree.command(name="banword")
+async def ban_word(interaction: discord.Interaction, word: str):
+    global banned_words
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to ban words.",
+            ephemeral=True,
+        )
+        return
+
+    word = word.strip()
+    if not word:
+        await interaction.response.send_message(
+            "Cannot ban an empty word.",
+            ephemeral=True,
+        )
+        return
+
+    banned_words_folded = {w.casefold() for w in banned_words}
+
+    if word.casefold() in banned_words_folded:
+        await interaction.response.send_message(
+            f'"{word}" is already in the banned words list.',
+            ephemeral=True,
+        )
+        return
+
+    banned_words.append(word)
+
+    with open(BANNED_WORDS_PATH, "w", encoding="utf-8") as f:
+        json.dump(banned_words, f, indent=2)
+
+    rebuild_banned_words_regex()
+
+    logger.info(f'Added "{word}" to banned words list via command.')
+    await interaction.response.send_message(
+        f'"{word}" has been added to the banned words list.',
+        ephemeral=True,
+    )
+
+@tree.command(name="unbanword")
+async def unban_word(interaction: discord.Interaction, word: str):
+    global banned_words
+
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to unban words.",
+            ephemeral=True,
+        )
+        return
+
+    word = word.strip()
+
+    match = next(
+        (w for w in banned_words if w.casefold() == word.casefold()),
+        None,
+    )
+
+    if match is None:
+        await interaction.response.send_message(
+            f'"{word}" is not in the banned words list.',
+            ephemeral=True,
+        )
+        return
+
+    banned_words.remove(match)
+
+    with open(BANNED_WORDS_PATH, "w", encoding="utf-8") as f:
+        json.dump(banned_words, f, indent=2)
+
+    rebuild_banned_words_regex()
+
+    logger.info(f'Removed "{match}" from banned words list via command.')
+    await interaction.response.send_message(
+        f'"{match}" has been removed from the banned words list.',
+        ephemeral=True,
+    )
+
 @tree.command(name="ban")
 async def ban_user(interaction: discord.Interaction, user: discord.User):
     if interaction.guild is None:
@@ -581,6 +771,18 @@ async def unban_user(interaction: discord.Interaction, user: discord.User):
         await interaction.response.send_message(f"An error occurred while trying to unban user {user.name}.", ephemeral=True)
     
 
+def clean_youtube_si_link(message: str) -> str | None:
+    youtube_si = YOUTUBE_SI_REGEX.search(message)
+
+    if not youtube_si:
+        return None
+
+    clean_url = f"https://youtu.be/{youtube_si.group('videoid')}"
+
+    if youtube_si.group("timestamp"):
+        clean_url += f"?t={youtube_si.group('timestamp')}"
+
+    return clean_url
 
 @client.event
 async def on_message(message: discord.Message):
@@ -601,18 +803,86 @@ async def on_message(message: discord.Message):
             logger.critical(e)
         return
     
-    if isinstance(message.author, discord.Member) and banned_substrings_regex and banned_substrings_regex.search(message.content):
+    if (
+        isinstance(message.author, discord.Member)
+        and (
+            (banned_substrings_regex and banned_substrings_regex.search(message.content))
+            or
+            (banned_words_regex and banned_words_regex.search(message.content))
+            or
+            (banned_regex_regex and banned_regex_regex.search(message.content))
+        )
+    ):
         try:
             await message.delete()
-            logger.info(f"Deleted message from {message.author.name} due to containing a banned substring.")
+            logger.info(f"Deleted message from {message.author.name} due to containing a banned substring, word or pattern.")
             if message.guild is not None:
-                await message.author.timeout(TIMEOUT_DURATION, reason="Message contained a banned substring")
-                logger.info(f"Timed out user {message.author.name} for sending a message with a banned substring.")
+                await message.author.timeout(TIMEOUT_DURATION, reason="Message contained a banned substring, word or pattern")
+                logger.info(f"Timed out user {message.author.name} for sending a message with a banned substring, word or pattern.")
+            return # don't process the message further since it has been deleted and the user has been timed out
         except discord.Forbidden as e:
             logger.error(f'Failed to delete message from {message.author.name} or timeout user. E: {e}')
         except Exception as e:
             logger.critical(e)
+        finally:
+            if os.path.exists(os.path.join("banned_stuff", "warnings_sent.json")):
+                with open(os.path.join("banned_stuff", "warnings_sent.json"), "r") as f:
+                    warnings_sent = json.load(f)
+                warnings_sent[str(message.author.id)] = warnings_sent.get(str(message.author.id), 0) + 1
+                warning_ordinal = ordinal(warnings_sent[str(message.author.id)])
+                await message.author.send(f"Your message contained a banned substring, word or pattern and has been removed. This is your {warning_ordinal} warning. Please adhere to the server rules to avoid further consequences.")
+                with open(os.path.join("banned_stuff", "warnings_sent.json"), "w") as f:
+                    json.dump(warnings_sent, f, indent=2)
+            else:
+                warnings_sent = {str(message.author.id): 1}
+                warning_ordinal = ordinal(warnings_sent[str(message.author.id)])
+                await message.author.send(f"Your message contained a banned substring, word or pattern and has been removed. This is your {warning_ordinal} warning. Please adhere to the server rules to avoid further consequences.")
+                with open(os.path.join("banned_stuff", "warnings_sent.json"), "w") as f:
+                    json.dump(warnings_sent, f, indent=2)
     
+    if cleaned := clean_youtube_si_link(message.content):
+        try:
+            await message.reply(f"{message.author.mention} Cleaned YouTube link with no SI tracking: {cleaned}")
+            logger.info(f"Cleaned a YouTube SI link from {message.author.name}'s message.")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to send cleaned YouTube link message in response to {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+
+    ### Pronoun channel meme
+    content = message.content.replace("’", "'")
+    if message.channel.id == 1510074902772711604 and PRONOUN_RE.search(content):
+        pronouns = PRONOUN_RE.findall(content)
+
+        # Dedupe while preserving order
+        pronouns = list(dict.fromkeys(p.lower() for p in pronouns))
+
+        p_string = ", ".join(f"`{p}`" for p in pronouns)
+
+        await message.reply(
+            f"This is a pronoun-free zone! You can't use {p_string} here."
+        )
+        try:
+            await message.add_reaction("❌")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to add reaction to pronoun message from {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+        return
+
+    ### No letter 'E' channel meme
+    if message.channel.id == 1510301194575151285 and 'e' in message.content.lower():
+        await message.reply(
+            "The letter 'E' is not allowed in this channel! Please remove it from your message."
+        )
+        try:
+            await message.add_reaction("❌")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to add reaction to message with letter E from {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+        return
+
     ### Counting game
     if message.channel.id == 1508224353488212050 and IS_INT_NUMBERS.match(message.content):
         counting_path = os.path.join("games", "counting.json")
@@ -903,12 +1173,19 @@ async def handle_ifttt_live(request: web.Request):
         logger.error(f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not a text channel or thread.")
         return web.Response(status=500, text="Channel configuration error")
 
-    await channel.send(
+    sent_message = await channel.send(
         f"@everyone\n"
         f"🔴 **{TWITCH_USERNAME} is live!**\n"
         f"Playing: {category}\n"
         f"{url}"
     )
+
+    try:
+        await sent_message.publish()
+    except discord.Forbidden:
+        logger.error(f"Failed to publish announcement message in {channel.name} due to permissions.")
+    except discord.HTTPException as e:
+        logger.error(f"Failed to publish announcement message in {channel.name}. HTTPException: {e}")
 
     return web.Response(text="OK")
 
