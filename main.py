@@ -46,6 +46,13 @@ BANNED_USERS_PATH = os.path.join("banned_stuff", "banned_users.json")
 BANNED_SUBSTRINGS_PATH = os.path.join("banned_stuff", "banned_substrings.json")
 BANNED_WORDS_PATH = os.path.join("banned_stuff", "banned_words.json")
 BANNED_REGEX_PATH = os.path.join("banned_stuff", "banned_regex.json")
+MESSAGE_RATE_PATH = os.path.join("banned_stuff", "message_rate.json")
+MESSAGE_RATE_WINDOW_SECONDS = 10
+MESSAGE_RATE_MAX_STORED = 50
+MESSAGE_RATE_LIMIT = 5 # if a user sends more than this many messages in the MESSAGE_RATE_WINDOW_SECONDS time window, they will be timed out for spamming
+SPAM_TIMEOUT_DURATION = timedelta(minutes=15)
+MODERATOR_NOTICES_CHANNEL_ID = 1510737589978791936
+MODERATOR_ROLE_ID = 1508158074014273668
 
 YOUTUBE_SI_REGEX = re.compile(
     r"youtu\.be/(?P<videoid>[A-Za-z0-9_-]{11})"
@@ -784,6 +791,124 @@ def clean_youtube_si_link(message: str) -> str | None:
 
     return clean_url
 
+async def spam_check(message: discord.Message) -> bool:
+    if not isinstance(message.author, discord.Member):
+        return False
+    
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread, discord.VoiceChannel)):
+        return False
+
+    if os.path.exists(MESSAGE_RATE_PATH):
+        with open(MESSAGE_RATE_PATH, "r", encoding="utf-8") as f:
+            message_rate = json.load(f)
+    else:
+        message_rate = {}
+
+    user_id_str = str(message.author.id)
+    now_timestamp = datetime_dt.now().timestamp()
+
+    recent_messages = message_rate.get(user_id_str, [])
+
+    recent_messages = [
+        [msg_id, ts]
+        for msg_id, ts in recent_messages
+        if now_timestamp - ts < MESSAGE_RATE_WINDOW_SECONDS
+    ]
+
+    recent_messages.append([message.id, now_timestamp])
+
+    # Keep only the most recent N messages for this user.
+    recent_messages = recent_messages[-MESSAGE_RATE_MAX_STORED:]
+
+    message_rate[user_id_str] = recent_messages
+
+    with open(MESSAGE_RATE_PATH, "w", encoding="utf-8") as f:
+        json.dump(message_rate, f, indent=2)
+
+    if len(recent_messages) > MESSAGE_RATE_LIMIT:
+        try:
+            mod_channel = client.get_channel(MODERATOR_NOTICES_CHANNEL_ID)
+            if isinstance(mod_channel, discord.TextChannel):
+                forwarded = await message.forward(mod_channel)
+                await forwarded.reply(
+                    f"User {message.author} is sending messages at a high rate and may be spamming. The above is the triggering message. Original channel: {message.channel.mention}"
+                )
+        except discord.Forbidden as e:
+            logger.error(f"Failed to forward potential spam message from {message.author.name} to moderator channel due to permissions. E: {e}")
+
+        try:
+            await message.author.timeout(
+                SPAM_TIMEOUT_DURATION,
+                reason="Spamming messages",
+            )
+            logger.info(
+                f"Timed out user {message.author.name} for spamming messages."
+            )
+
+            await message.author.send(
+                f"{message.author.mention} You have been timed out for spamming messages. Please slow down to avoid further penalties."
+            )
+
+        except discord.Forbidden as e:
+            logger.error(
+                f"Failed to timeout user {message.author.name} for spamming. E: {e}"
+            )
+            await message.author.send(
+                f"{message.author.mention} You have been detected spamming messages, but I was unable to timeout you due to permissions. Please slow down to avoid further penalties."
+            )
+        except Exception as e:
+            logger.critical(e)
+
+        return True
+
+    return False
+
+async def delete_spammed_messages(message: discord.Message) -> None:
+    if not isinstance(message.author, discord.Member):
+        return
+
+    if not isinstance(
+        message.channel,
+        (discord.TextChannel, discord.Thread, discord.VoiceChannel),
+    ):
+        return
+
+    if not os.path.exists(MESSAGE_RATE_PATH):
+        return
+
+    with open(MESSAGE_RATE_PATH, "r", encoding="utf-8") as f:
+        message_rate = json.load(f)
+
+    user_id_str = str(message.author.id)
+    recent_messages = message_rate.get(user_id_str, [])
+
+    now_timestamp = datetime_dt.now().timestamp()
+    delete_window = MESSAGE_RATE_WINDOW_SECONDS * 2
+
+    for msg_id, ts in recent_messages:
+        if now_timestamp - ts >= delete_window:
+            continue
+
+        try:
+            msg = await message.channel.fetch_message(msg_id)
+            await msg.delete()
+
+            logger.info(
+                f"Deleted spam message with ID {msg_id} from user {message.author.name}."
+            )
+
+        except discord.NotFound:
+            logger.warning(
+                f"Could not find message with ID {msg_id} to delete for user {message.author.name}. "
+                "It may have already been deleted, or it may be in another channel."
+            )
+        except discord.Forbidden as e:
+            logger.error(
+                f"Failed to delete spam message with ID {msg_id} from user {message.author.name} due to permissions. E: {e}"
+            )
+        except Exception as e:
+            logger.critical(e)
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -840,6 +965,9 @@ async def on_message(message: discord.Message):
                 with open(os.path.join("banned_stuff", "warnings_sent.json"), "w") as f:
                     json.dump(warnings_sent, f, indent=2)
     
+    if await spam_check(message):
+        return # if the user is spamming messages, we timeout them and don't process the message further
+
     if cleaned := clean_youtube_si_link(message.content):
         try:
             await message.reply(f"{message.author.mention} Cleaned YouTube link with no SI tracking: {cleaned}")
