@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 import discord
-from discord import app_commands
+from discord import Poll, app_commands
 import logging
 import os
 from datetime import timedelta
@@ -15,6 +15,7 @@ import asyncio
 import random
 import json
 import re
+import datetime
 
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
@@ -828,10 +829,12 @@ async def spam_check(message: discord.Message) -> bool:
     if len(recent_messages) > MESSAGE_RATE_LIMIT:
         try:
             mod_channel = client.get_channel(MODERATOR_NOTICES_CHANNEL_ID)
+            mod_role = message.guild.get_role(MODERATOR_ROLE_ID) if message.guild else None
+            mod_mention = mod_role.mention if mod_role else "Moderators"
             if isinstance(mod_channel, discord.TextChannel):
                 forwarded = await message.forward(mod_channel)
                 await forwarded.reply(
-                    f"User {message.author} is sending messages at a high rate and may be spamming. The above is the triggering message. Original channel: {message.channel.mention}"
+                    f"{mod_mention}, User {message.author.mention} ({message.author.id}) is sending messages at a high rate and may be spamming. The above is the triggering message. I timed them out, but you may decide to ban them. Original channel: {message.channel.mention}"
                 )
         except discord.Forbidden as e:
             logger.error(f"Failed to forward potential spam message from {message.author.name} to moderator channel due to permissions. E: {e}")
@@ -909,6 +912,20 @@ async def delete_spammed_messages(message: discord.Message) -> None:
         except Exception as e:
             logger.critical(e)
 
+async def send_suggested_poll(message: discord.Message):
+    if not isinstance(message.author, discord.Member):
+        return
+    if not isinstance(message.channel, (discord.TextChannel, discord.Thread)):
+        return
+    
+    poll = Poll(message.content.strip(), datetime.timedelta(hours=1))
+    poll.add_answer(text="Yes")
+    poll.add_answer(text="No")
+
+    await message.reply("Here's a suggested poll based on your message content:", poll=poll)
+
+from fun_stuff.brittishification import brittishify
+
 @client.event
 async def on_message(message: discord.Message):
     if message.author.bot:
@@ -968,12 +985,27 @@ async def on_message(message: discord.Message):
     if await spam_check(message):
         return # if the user is spamming messages, we timeout them and don't process the message further
 
+    if message.content.strip()[-1] == "?":
+        await send_suggested_poll(message)
+
     if cleaned := clean_youtube_si_link(message.content):
         try:
             await message.reply(f"{message.author.mention} Cleaned YouTube link with no SI tracking: {cleaned}")
             logger.info(f"Cleaned a YouTube SI link from {message.author.name}'s message.")
         except discord.Forbidden as e:
             logger.error(f'Failed to send cleaned YouTube link message in response to {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+
+    ### Brittishification channel meme
+    if message.channel.id == 1514557077912289280:
+        try:
+            britt_message, changed = brittishify(message.content)
+            if changed:
+                await message.reply(f"{message.author.mention} Here's your message Brittishified: {britt_message}")
+                logger.info(f"Brittishified a message from {message.author.name}.")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to send Brittishified message in response to {message.author.name}. E: {e}')
         except Exception as e:
             logger.critical(e)
 
@@ -999,7 +1031,7 @@ async def on_message(message: discord.Message):
         return
 
     ### No letter 'E' channel meme
-    if message.channel.id == 1510301194575151285 and 'e' in message.content.lower():
+    if message.channel.id == 1510301194575151285 and 'e' in message.content.lower() and message.author.id != 330283683246505996:
         await message.reply(
             "The letter 'E' is not allowed in this channel! Please remove it from your message."
         )
@@ -1007,6 +1039,30 @@ async def on_message(message: discord.Message):
             await message.add_reaction("❌")
         except discord.Forbidden as e:
             logger.error(f'Failed to add reaction to message with letter E from {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+        return
+    if message.channel.id == 1510301194575151285 and message.author.id == 330283683246505996 and (set(re.sub(r'[^a-z]', '', message.content.lower())) - set('elfangorax')):
+        await message.reply(
+            f"For you {message.author.mention} you can only use the letters in 'Elfangorax' in this channel. Please remove any other letters from your message."
+        )
+        try:
+            await message.add_reaction("❌")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to add reaction to message with invalid letters from {message.author.name}. E: {e}')
+        except Exception as e:
+            logger.critical(e)
+        return
+    
+    # you can only say letters in your own name
+    if message.channel.id == 1512556314792952059 and set(re.sub(r'[^a-z]', '', message.content.lower())) - set(re.sub(r'[^a-z]', '', message.author.display_name.lower())):
+        await message.reply(
+            f"For you {message.author.mention} you can only use the letters that are in {message.author.display_name} in this channel. Please remove any other letters from your message."
+        )
+        try:
+            await message.add_reaction("❌")
+        except discord.Forbidden as e:
+            logger.error(f'Failed to add reaction to message with invalid letters from {message.author.display_name}. E: {e}')
         except Exception as e:
             logger.critical(e)
         return
@@ -1276,11 +1332,36 @@ async def echomode(
         )
 
 from aiohttp import web
+from yt_dlp import YoutubeDL
+from typing import Any, cast
 
 DISCORD_LIVE_CHANNEL_ID = int(os.environ["DISCORD_LIVE_CHANNEL_ID"])
 IFTTT_SHARED_SECRET = os.environ["IFTTT_SHARED_SECRET"]
 TWITCH_USERNAME = os.environ["TWITCH_USERNAME"]
 
+
+def get_twitch_stream_title(url: str) -> str | None:
+    opts = cast(Any, {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+    })
+
+    try:
+        with YoutubeDL(opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+    except Exception:
+        return None
+
+    if not isinstance(info, dict):
+        return None
+
+    title = info.get("description")
+
+    if not isinstance(title, str):
+        return None
+
+    return title.strip() or None
 
 async def handle_ifttt_live(request: web.Request):
     secret = request.headers.get("X-Webhook-Secret")
@@ -1301,10 +1382,14 @@ async def handle_ifttt_live(request: web.Request):
         logger.error(f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not a text channel or thread.")
         return web.Response(status=500, text="Channel configuration error")
 
+    # get stream title with yt-dlp --skip-download --print description "https://www.twitch.tv/username"
+    stream_title = get_twitch_stream_title(url) or "Unknown title"
+
     sent_message = await channel.send(
         f"@everyone\n"
         f"🔴 **{TWITCH_USERNAME} is live!**\n"
         f"Playing: {category}\n"
+        f"Title: {stream_title}\n"
         f"{url}"
     )
 
