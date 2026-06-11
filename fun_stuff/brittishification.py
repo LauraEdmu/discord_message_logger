@@ -2,6 +2,8 @@ import re
 
 WORD_SUBS = {
     'color': 'colour',
+    'armor': 'armour',
+    'favorite': 'favourite',
     'flavor': 'flavour',
     'neighbor': 'neighbour',
     'center': 'centre',
