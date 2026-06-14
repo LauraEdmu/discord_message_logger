@@ -1402,6 +1402,39 @@ async def handle_ifttt_live(request: web.Request):
 
     return web.Response(text="OK")
 
+from twitch_stuff.live_check import twitch_is_live
+
+@tree.command(name="newcategory")
+async def new_category(interaction: discord.Interaction, category: str):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to change the category.",
+            ephemeral=True,
+        )
+        return
+
+    if not twitch_is_live(TWITCH_USERNAME):
+        await interaction.response.send_message(
+            f"{TWITCH_USERNAME} is not currently live on Twitch. Cannot change category.",
+            ephemeral=True,
+        )
+        return
+
+    twitch_category = category.strip()
+    twitch_title = get_twitch_stream_title(f"https://twitch.tv/{TWITCH_USERNAME}") or "Unknown title"
+
+    logger.info(f'Changed Twitch category to "{twitch_category}" via command.')
+    await interaction.response.send_message(
+        f'@everyone\nTwitch category has been changed to: "{twitch_category}".\nStream title is now: "{twitch_title}".',
+        ephemeral=False,
+    )
 
 async def start_web_server():
     app = web.Application()
