@@ -1332,36 +1332,12 @@ async def echomode(
         )
 
 from aiohttp import web
-from yt_dlp import YoutubeDL
-from typing import Any, cast
+from twitch_stuff.stream_info import get_twitch_stream_title
 
 DISCORD_LIVE_CHANNEL_ID = int(os.environ["DISCORD_LIVE_CHANNEL_ID"])
 IFTTT_SHARED_SECRET = os.environ["IFTTT_SHARED_SECRET"]
 TWITCH_USERNAME = os.environ["TWITCH_USERNAME"]
 
-
-def get_twitch_stream_title(url: str) -> str | None:
-    opts = cast(Any, {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-    })
-
-    try:
-        with YoutubeDL(opts) as ydl:
-            info = ydl.extract_info(url, download=False)
-    except Exception:
-        return None
-
-    if not isinstance(info, dict):
-        return None
-
-    title = info.get("description")
-
-    if not isinstance(title, str):
-        return None
-
-    return title.strip() or None
 
 async def handle_ifttt_live(request: web.Request):
     secret = request.headers.get("X-Webhook-Secret")
@@ -1383,13 +1359,21 @@ async def handle_ifttt_live(request: web.Request):
         return web.Response(status=500, text="Channel configuration error")
 
     # get stream title with yt-dlp --skip-download --print description "https://www.twitch.tv/username"
-    stream_title = get_twitch_stream_title(url) or "Unknown title"
+    stream_title, started_at = get_twitch_stream_title(url)
+
+    if stream_title is None:
+        stream_title = "Unknown title"
+    if started_at is None:
+        started_text = "Unknown start time"
+    else:
+        started_text = f"<t:{started_at}:f>"
 
     sent_message = await channel.send(
         f"@everyone\n"
         f"🔴 **{TWITCH_USERNAME} is live!**\n"
         f"Playing: {category}\n"
         f"Title: {stream_title}\n"
+        f"Started at: {started_text}\n"
         f"{url}"
     )
 
@@ -1428,7 +1412,9 @@ async def new_category(interaction: discord.Interaction, category: str):
         return
 
     twitch_category = category.strip()
-    twitch_title = get_twitch_stream_title(f"https://twitch.tv/{TWITCH_USERNAME}") or "Unknown title"
+    twitch_title, _ = get_twitch_stream_title(f"https://twitch.tv/{TWITCH_USERNAME}")
+    if twitch_title is None:
+        twitch_title = "Unknown title"
 
     logger.info(f'Changed Twitch category to "{twitch_category}" via command.')
     await interaction.response.send_message(
