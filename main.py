@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from pathlib import Path
+
 import discord
 from discord import Poll, app_commands
 import logging
@@ -1330,6 +1332,91 @@ async def echomode(
             "Something went wrong while sending that.",
             ephemeral=True
         )
+
+from pathlib import Path
+
+from fun_stuff.quizing import QuizHandler
+
+BASE_DIR = Path(__file__).parent
+
+quiz_path = BASE_DIR / "quiz_stuff" / "questions.jsonl"
+quiz_path.parent.mkdir(parents=True, exist_ok=True)
+
+quiz_handler = QuizHandler(str(quiz_path))
+
+
+def get_quiz_scope_id(interaction: discord.Interaction) -> str:
+    """
+    Use guild ID for server-wide quizzes.
+    Fall back to user ID for DMs.
+    """
+    return str(interaction.guild.id if interaction.guild else interaction.user.id)
+
+
+def ensure_questions_loaded() -> bool:
+    """
+    Try to reload questions if none are currently loaded.
+    Returns True if questions are available.
+    """
+    if not quiz_handler.questions:
+        quiz_handler.reload_questions()
+
+    return bool(quiz_handler.questions)
+
+
+@tree.command(name="question")
+async def ask_question(interaction: discord.Interaction):
+    id_for_quiz = get_quiz_scope_id(interaction)
+
+    if not ensure_questions_loaded():
+        await interaction.response.send_message(
+            "No quiz questions are available at the moment.",
+            ephemeral=True,
+        )
+        return
+
+    question = quiz_handler.get_current_question(id_for_quiz)
+
+    if question:
+        await interaction.response.send_message(
+            f"**Quiz Question:** {question['question']}"
+        )
+    else:
+        await interaction.response.send_message(
+            "No quiz question is available.",
+            ephemeral=True,
+        )
+
+
+@tree.command(name="answer")
+async def answer_question(interaction: discord.Interaction, answer: str):
+    id_for_quiz = get_quiz_scope_id(interaction)
+
+    if not ensure_questions_loaded():
+        await interaction.response.send_message(
+            "No quiz questions are available at the moment.",
+            ephemeral=True,
+        )
+        return
+
+    question_index = quiz_handler.get_question_index(id_for_quiz)
+    correct, real_answer = quiz_handler.check_answer(answer, question_index)
+
+    if real_answer == "":
+        await interaction.response.send_message(
+            "No quiz question is available.",
+            ephemeral=True,
+        )
+        return
+
+    if correct:
+        response_text = f"Correct, {interaction.user.mention}! The answer is {real_answer}."
+    else:
+        response_text = f"Incorrect, {interaction.user.mention}. The correct answer was: {real_answer}"
+
+    quiz_handler.advance_question_index(id_for_quiz)
+
+    await interaction.response.send_message(response_text)
 
 from aiohttp import web
 from twitch_stuff.stream_info import get_twitch_stream_title
