@@ -20,11 +20,14 @@ class QuizHandler:
 
         questions = []
 
-        with self.file_path.open("r", encoding="utf-8") as file:
-            for line in file:
-                if line.strip():
-                    quiz_item = json.loads(line)
-                    questions.append(quiz_item)
+        try:
+            with self.file_path.open("r", encoding="utf-8") as file:
+                for line in file:
+                    if line.strip():
+                        quiz_item = json.loads(line)
+                        questions.append(quiz_item)
+        except json.JSONDecodeError:
+            pass
 
         return questions
 
@@ -69,6 +72,10 @@ class QuizHandler:
     def get_question_index(self, user_id: str) -> int:
         """
         Get the current question index for a user/guild.
+
+        Returns:
+        - -1 if the quiz is complete
+        - 0..len(self.questions)-1 for the current question
         """
         if not self.questions:
             return -1
@@ -76,8 +83,18 @@ class QuizHandler:
         data = self._load_progress()
         index = data.get(str(user_id), 0)
 
-        # Keeps old progress safe if the quiz shrinks.
-        return index % len(self.questions)
+        # Preserve completion state.
+        if index == -1:
+            return -1
+
+        # Keeps old/corrupt progress safe if the quiz changes.
+        if index < 0:
+            return 0
+
+        if index >= len(self.questions):
+            return len(self.questions) - 1
+
+        return index
 
     def advance_question_index(self, user_id: str) -> None:
         """
@@ -90,7 +107,9 @@ class QuizHandler:
 
         data = self._load_progress()
         current_index = data.get(user_id, 0)
-        new_index = (current_index + 1) % len(self.questions)
+        new_index = (current_index + 1)
+        if new_index >= len(self.questions) or new_index <= 0:
+            new_index = -1  # Indicates that the user has completed the quiz.
 
         data[user_id] = new_index
         self._save_progress(data)
@@ -139,3 +158,19 @@ class QuizHandler:
             return False, real_answer
 
         return is_correct, real_answer
+    
+    def check_progress(self, user_id: str) -> tuple[int, int]:
+        """
+        Return the current question index for a user, as well as the total number of questions in the quiz.
+        """
+        index = self.get_question_index(user_id)
+        total_questions = len(self.questions)
+        return index, total_questions
+    
+    def reset_progress(self, user_id: str) -> None:
+        """
+        Reset the quiz progress for a user/guild.
+        """
+        data = self._load_progress()
+        data[str(user_id)] = 0
+        self._save_progress(data)

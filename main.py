@@ -1373,6 +1373,7 @@ async def ask_question(interaction: discord.Interaction):
             "No quiz questions are available at the moment.",
             ephemeral=True,
         )
+        logger.debug("No quiz questions are available when /question command was invoked.")
         return
 
     question = quiz_handler.get_current_question(id_for_quiz)
@@ -1386,7 +1387,32 @@ async def ask_question(interaction: discord.Interaction):
             "No quiz question is available.",
             ephemeral=True,
         )
+        logger.debug("No quiz question is available when /question command was invoked.")
 
+def make_progress_bar(current_index: int, total: int, width: int = 10) -> str:
+    """
+    current_index is the next question index.
+    So:
+    - 0 means 0 questions answered
+    - 1 means 1 question answered
+    - -1 means quiz complete
+    """
+    if total <= 0:
+        return "Progress: No questions."
+
+    if current_index == -1:
+        answered = total
+    else:
+        answered = max(0, min(current_index, total))
+
+    progress = answered / total
+
+    filled = round(progress * width)
+    empty = width - filled
+
+    bar = "█" * filled + "░" * empty
+
+    return f"Progress: `[{bar}]` {answered} of {total}"
 
 @tree.command(name="answer")
 async def answer_question(interaction: discord.Interaction, answer: str):
@@ -1397,6 +1423,7 @@ async def answer_question(interaction: discord.Interaction, answer: str):
             "No quiz questions are available at the moment.",
             ephemeral=True,
         )
+        logger.debug("No quiz questions are available when /answer command was invoked.")
         return
 
     question_index = quiz_handler.get_question_index(id_for_quiz)
@@ -1407,6 +1434,7 @@ async def answer_question(interaction: discord.Interaction, answer: str):
             "No quiz question is available.",
             ephemeral=True,
         )
+        logger.debug("No quiz question is available when /answer command was invoked.")
         return
 
     if correct:
@@ -1416,7 +1444,15 @@ async def answer_question(interaction: discord.Interaction, answer: str):
 
     quiz_handler.advance_question_index(id_for_quiz)
 
-    await interaction.response.send_message(response_text)
+    question_index, total_questions = quiz_handler.check_progress(id_for_quiz)
+    progress_text = make_progress_bar(question_index, total_questions)
+
+    await interaction.response.send_message(f"{response_text}\n{progress_text}")
+
+    if question_index == -1:
+        await interaction.followup.send(
+            f"{interaction.user.mention}, you've completed the quiz!"
+        )
 
 @tree.command(name="reload_questions")
 async def reload_questions(interaction: discord.Interaction):
@@ -1445,6 +1481,29 @@ async def reload_questions(interaction: discord.Interaction):
             "Reloaded quiz questions, but no questions are currently available.",
             ephemeral=True,
         )
+
+@tree.command(name="reset_quiz")
+async def reset_quiz(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to reset quiz progress.",
+            ephemeral=True,
+        )
+        return
+
+    id_for_quiz = get_quiz_scope_id(interaction)
+    quiz_handler.reset_progress(id_for_quiz)
+
+    await interaction.response.send_message(
+        "Quiz progress has been reset."
+    )
 
 from aiohttp import web
 from twitch_stuff.stream_info import get_twitch_stream_title
