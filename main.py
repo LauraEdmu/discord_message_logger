@@ -1418,6 +1418,34 @@ async def answer_question(interaction: discord.Interaction, answer: str):
 
     await interaction.response.send_message(response_text)
 
+@tree.command(name="reload_questions")
+async def reload_questions(interaction: discord.Interaction):
+    if interaction.guild is None:
+        await interaction.response.send_message(
+            "This command can only be used in a server.",
+            ephemeral=True,
+        )
+        return
+
+    if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            "Not permitted to reload quiz questions.",
+            ephemeral=True,
+        )
+        return
+
+    quiz_handler.reload_questions()
+
+    if quiz_handler.questions:
+        await interaction.response.send_message(
+            f"Reloaded quiz questions. {len(quiz_handler.questions)} questions are now available."
+        )
+    else:
+        await interaction.response.send_message(
+            "Reloaded quiz questions, but no questions are currently available.",
+            ephemeral=True,
+        )
+
 from aiohttp import web
 from twitch_stuff.stream_info import get_twitch_stream_title
 

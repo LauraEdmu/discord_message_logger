@@ -122,24 +122,20 @@ class QuizHandler:
         return self.get_question(index)
 
     def check_answer(self, answer_str: str, question_index: int) -> tuple[bool, str]:
-        """
-        Check if an answer is correct for a given question index.
-
-        Expected JSONL format:
-
-        {"question": "Where is Paris?", "pattern": "france", "answer": "France"}
-        {"question": "What is Luna?", "pattern": "moon|satellite", "answer": "A moon / satellite"}
-        """
         question = self.get_question(question_index)
 
         if not question:
             return False, ""
 
         pattern = question.get("pattern", "")
-        real_answer = question.get("answer", "")
+        real_answer = question.get("answer", pattern)
 
-        if not pattern or not real_answer:
+        if not pattern:
             return False, ""
 
-        is_correct = bool(re.search(pattern, answer_str, re.IGNORECASE))
+        try:
+            is_correct = bool(re.search(pattern, answer_str, re.IGNORECASE))
+        except re.error:
+            return False, real_answer
+
         return is_correct, real_answer
