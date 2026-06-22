@@ -8,3 +8,4 @@ __pycache__/
 *.json
 close_discord.py
 quiz_stuff/
+per_guild_info/

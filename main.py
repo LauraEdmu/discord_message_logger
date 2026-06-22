@@ -18,6 +18,7 @@ import random
 import json
 import re
 import datetime
+import aiofiles
 
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
@@ -93,6 +94,9 @@ needed_intents.message_content = True
 needed_intents.members = True
 # client = discord.Client(intents=needed_intents)
 # tree = app_commands.CommandTree(client)
+
+PER_GUILD_DIR = Path("per_guild_info")
+guild_infos: dict[int, Path] = {}
 
 class MyClient(discord.Client):
     db_pool: asyncpg.Pool
@@ -375,6 +379,14 @@ async def on_ready():
         else None
     )
 
+    PER_GUILD_DIR.mkdir(exist_ok=True)
+
+    for guild in client.guilds:
+        guild_path = PER_GUILD_DIR / str(guild.id)
+        guild_path.mkdir(exist_ok=True)
+
+        guild_infos[guild.id] = guild_path
+
     try:
         async with client.db_pool.acquire() as conn:
             await conn.execute("""
@@ -425,11 +437,16 @@ async def on_ready():
     if not getattr(client, "web_server_started", False):
         client.web_server_started = True
         client.loop.create_task(start_web_server())
+    
 
     logger.debug("Got to end of on_ready")
 
 @client.event
 async def on_guild_join(guild: discord.Guild): # log new guild info to db when bot is added to a new server
+    guild_path = PER_GUILD_DIR / str(guild.id)
+    guild_path.mkdir(exist_ok=True)
+    guild_infos[guild.id] = guild_path
+    
     try:
         async with client.db_pool.acquire() as conn:
             await conn.execute("""
@@ -485,7 +502,14 @@ async def on_member_join(member: discord.Member): # log new user info to db when
         logger.critical(e)
 
     guild = member.guild
-    role = guild.get_role(1508144612370419835) # role ID for "Apprentices" role, which is given to new members on join
+    roles_location = Path(guild_infos[guild.id]) / "roles.json"
+    if roles_location.exists():
+        async with aiofiles.open(roles_location, "r", encoding="utf-8") as f:
+            roles_data = await f.read()
+            roles_dict = json.loads(roles_data)
+
+        role_id = roles_dict.get("member", None)
+        role = guild.get_role(role_id) if role_id else None
     logger.debug(f"Member {member.name} joined")
     
     if role:
