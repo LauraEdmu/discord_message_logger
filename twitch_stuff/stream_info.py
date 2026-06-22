@@ -18,7 +18,9 @@ def get_twitch_stream_title(url: str) -> tuple[str | None, int | None]:
         return None, None
 
     title = info.get("description")
-    started_at = info.get("release_timestamp")
+    started_at = info.get("timestamp")
+    if started_at is not None:
+        started_at = int(started_at)
 
     if not isinstance(title, str):
         return None, None

@@ -987,8 +987,11 @@ async def on_message(message: discord.Message):
     if await spam_check(message):
         return # if the user is spamming messages, we timeout them and don't process the message further
 
-    if message.content.strip()[-1] == "?":
-        await send_suggested_poll(message)
+    try:
+        if message.content.strip()[-1] == "?":
+            await send_suggested_poll(message)
+    except IndexError:
+        pass
 
     if cleaned := clean_youtube_si_link(message.content):
         try:
@@ -1517,12 +1520,15 @@ async def handle_ifttt_live(request: web.Request):
     secret = request.headers.get("X-Webhook-Secret")
 
     if secret != IFTTT_SHARED_SECRET:
+        logger.warning("Received IFTTT webhook with invalid secret.")
         return web.Response(status=403, text="Forbidden")
 
     data = await request.json()
 
     category = data.get("category", "Unknown category")
     url = data.get("url", f"https://twitch.tv/{TWITCH_USERNAME}")
+    if category == "Unknown category":
+        logger.warning("Received IFTTT webhook with missing category.")
 
     channel = client.get_channel(DISCORD_LIVE_CHANNEL_ID)
     if channel is None:
@@ -1537,8 +1543,10 @@ async def handle_ifttt_live(request: web.Request):
 
     if stream_title is None:
         stream_title = "Unknown title"
+        logger.warning("Received IFTTT webhook but could not retrieve stream title.")
     if started_at is None:
         started_text = "Unknown start time"
+        logger.warning("Received IFTTT webhook but could not retrieve stream start time.")
     else:
         started_text = f"<t:{started_at}:f>"
 
