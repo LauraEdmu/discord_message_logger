@@ -19,6 +19,7 @@ import json
 import re
 import datetime
 import aiofiles
+from twitch_live import TwitchLiveEvent, TwitchLiveWatcher
 
 BATCH_SIZE = 100
 FLUSH_INTERVAL = 1.0
@@ -112,6 +113,9 @@ class MyClient(discord.Client):
 
     flush_task: asyncio.Task | None = None
 
+    twitch_live: TwitchLiveWatcher
+    twitch_live_task: asyncio.Task | None = None
+
     async def setup_hook(self):
         self.db_pool = await asyncpg.create_pool(
             os.getenv("psql_url"),
@@ -128,9 +132,59 @@ class MyClient(discord.Client):
 
         self.flush_task = asyncio.create_task(message_flush_loop())
 
+        self.twitch_live = TwitchLiveWatcher(
+            client_id=os.environ["TWITCH_CLIENT_ID"],
+            client_secret=os.environ["TWITCH_CLIENT_SECRET"],
+            broadcaster_user_id=os.environ["TWITCH_BROADCASTER_ID"],
+            token_file=os.getenv("TWITCH_TOKEN_FILE", "twitch_tokens.json"),
+            state_file=os.getenv("TWITCH_LIVE_STATE_FILE", "twitch_live_state.json"),
+        )
+
+        self.twitch_live_task = asyncio.create_task(
+            self.twitch_live.run(self.on_twitch_live)
+        )
+    
+    async def on_twitch_live(self, event: TwitchLiveEvent) -> None:
+        channel = self.get_channel(DISCORD_LIVE_CHANNEL_ID)
+
+        if channel is None:
+            channel = await self.fetch_channel(DISCORD_LIVE_CHANNEL_ID)
+
+        if not isinstance(channel, discord.abc.Messageable):
+            logger.error(
+                f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not messageable."
+            )
+            return
+
+        sent_message = await channel.send(
+            f"@everyone\n"
+            f"🔴 **{event.broadcaster_name} is live!**\n"
+            f"**Title:** {event.title}\n"
+            f"**Game:** {event.game_name}\n"
+            f"https://twitch.tv/{event.broadcaster_login}"
+        )
+
+        try:
+            await sent_message.publish()
+        except discord.Forbidden:
+            logger.error("Failed to publish Twitch live announcement due to permissions.")
+        except discord.HTTPException as e:
+            logger.error(f"Failed to publish Twitch live announcement: {e}")
+
     async def close(self):
         try:
             await flush_buffers()
+
+            if hasattr(self, "twitch_live"):
+                await self.twitch_live.stop()
+
+            if self.twitch_live_task:
+                self.twitch_live_task.cancel()
+                try:
+                    await self.twitch_live_task
+                except asyncio.CancelledError:
+                    pass
+
         finally:
             await super().close()
 
@@ -288,9 +342,6 @@ async def on_ready():
 
     await tree.sync()
     
-    if not getattr(client, "web_server_started", False):
-        client.web_server_started = True
-        client.loop.create_task(start_web_server())
 
     # load short jokes csv
     with open("shortjokes.csv", newline="", encoding="utf-8") as csvfile:
@@ -434,9 +485,6 @@ async def on_ready():
     except Exception as e:
         logger.error(f"Error logging startup user info: {e}", exc_info=True)
     
-    if not getattr(client, "web_server_started", False):
-        client.web_server_started = True
-        client.loop.create_task(start_web_server())
     
 
     logger.debug("Got to end of on_ready")
@@ -458,6 +506,43 @@ async def on_guild_join(guild: discord.Guild): # log new guild info to db when b
             """, guild.id, guild.name, guild.owner_id)
     except Exception as e:
         logger.error(f"Error logging joined guild info: {e}", exc_info=True)
+
+async def dm_member_with_retry(
+    member: discord.Member,
+    content: str,
+    delays: tuple[float, ...] = (2, 5, 10),
+) -> bool:
+    """
+    Try to DM a member after short delays.
+
+    Returns True if sent, False if all attempts failed.
+    """
+    for attempt, delay in enumerate(delays, start=1):
+        await asyncio.sleep(delay)
+
+        try:
+            await member.send(content)
+            return True
+
+        except discord.Forbidden:
+            logger.debug(
+                "Could not DM %s on attempt %s/%s",
+                member,
+                attempt,
+                len(delays),
+            )
+
+        except discord.HTTPException as e:
+            logger.debug(
+                "HTTP error while DMing %s on attempt %s/%s: %s",
+                member,
+                attempt,
+                len(delays),
+                e,
+            )
+
+    logger.info("Could not DM %s after joining.", member)
+    return False
 
 @client.event
 async def on_member_join(member: discord.Member): # log new user info to db when a new user joins a server the bot is in
@@ -492,14 +577,6 @@ async def on_member_join(member: discord.Member): # log new user info to db when
     except Exception as e:
         logger.error(f"Error logging new member info: {e}", exc_info=True)
     
-    try:
-        await member.send(fr"Welcome to the server, {member.display_name}!")
-
-        logger.debug(f"Send onboarding message to {member.display_name}")
-    except discord.Forbidden as e:
-        logger.error(f'Failed to message {member.name} on join. E: {e}')
-    except Exception as e:
-        logger.critical(e)
 
     guild = member.guild
     roles_location = Path(guild_infos[guild.id]) / "roles.json"
@@ -520,6 +597,8 @@ async def on_member_join(member: discord.Member): # log new user info to db when
         except discord.Forbidden as e:
             logger.error(f'Failed to assign {role.name} role to {member.name}. E: {e}')
             print(f'Failed to assign {role.name} role to {member.name}')
+    
+    await dm_member_with_retry(member, fr"Welcome to the server, {member.display_name}!")
 
 def rebuild_banned_substrings_regex() -> None:
     global banned_substrings_regex
@@ -1532,7 +1611,6 @@ async def reset_quiz(interaction: discord.Interaction):
         "Quiz progress has been reset."
     )
 
-from aiohttp import web
 from twitch_stuff.stream_info import get_twitch_stream_title
 
 DISCORD_LIVE_CHANNEL_ID = int(os.environ["DISCORD_LIVE_CHANNEL_ID"])
@@ -1540,57 +1618,57 @@ IFTTT_SHARED_SECRET = os.environ["IFTTT_SHARED_SECRET"]
 TWITCH_USERNAME = os.environ["TWITCH_USERNAME"]
 
 
-async def handle_ifttt_live(request: web.Request):
-    secret = request.headers.get("X-Webhook-Secret")
+# async def handle_ifttt_live(request: web.Request):
+#     secret = request.headers.get("X-Webhook-Secret")
 
-    if secret != IFTTT_SHARED_SECRET:
-        logger.warning("Received IFTTT webhook with invalid secret.")
-        return web.Response(status=403, text="Forbidden")
+#     if secret != IFTTT_SHARED_SECRET:
+#         logger.warning("Received IFTTT webhook with invalid secret.")
+#         return web.Response(status=403, text="Forbidden")
 
-    data = await request.json()
+#     data = await request.json()
 
-    category = data.get("category", "Unknown category")
-    url = data.get("url", f"https://twitch.tv/{TWITCH_USERNAME}")
-    if category == "Unknown category":
-        logger.warning("Received IFTTT webhook with missing category.")
+#     category = data.get("category", "Unknown category")
+#     url = data.get("url", f"https://twitch.tv/{TWITCH_USERNAME}")
+#     if category == "Unknown category":
+#         logger.warning("Received IFTTT webhook with missing category.")
 
-    channel = client.get_channel(DISCORD_LIVE_CHANNEL_ID)
-    if channel is None:
-        channel = await client.fetch_channel(DISCORD_LIVE_CHANNEL_ID)
+#     channel = client.get_channel(DISCORD_LIVE_CHANNEL_ID)
+#     if channel is None:
+#         channel = await client.fetch_channel(DISCORD_LIVE_CHANNEL_ID)
     
-    if not isinstance(channel, SENDABLE_CHANNEL_TYPES):
-        logger.error(f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not a text channel or thread.")
-        return web.Response(status=500, text="Channel configuration error")
+#     if not isinstance(channel, SENDABLE_CHANNEL_TYPES):
+#         logger.error(f"Channel with ID {DISCORD_LIVE_CHANNEL_ID} is not a text channel or thread.")
+#         return web.Response(status=500, text="Channel configuration error")
 
-    # get stream title with yt-dlp --skip-download --print description "https://www.twitch.tv/username"
-    stream_title, started_at = get_twitch_stream_title(url)
+#     # get stream title with yt-dlp --skip-download --print description "https://www.twitch.tv/username"
+#     stream_title, started_at = get_twitch_stream_title(url)
 
-    if stream_title is None:
-        stream_title = "Unknown title"
-        logger.warning("Received IFTTT webhook but could not retrieve stream title.")
-    if started_at is None:
-        started_text = "Unknown start time"
-        logger.warning("Received IFTTT webhook but could not retrieve stream start time.")
-    else:
-        started_text = f"<t:{started_at}:f>"
+#     if stream_title is None:
+#         stream_title = "Unknown title"
+#         logger.warning("Received IFTTT webhook but could not retrieve stream title.")
+#     if started_at is None:
+#         started_text = "Unknown start time"
+#         logger.warning("Received IFTTT webhook but could not retrieve stream start time.")
+#     else:
+#         started_text = f"<t:{started_at}:f>"
 
-    sent_message = await channel.send(
-        f"@everyone\n"
-        f"🔴 **{TWITCH_USERNAME} is live!**\n"
-        f"Playing: {category}\n"
-        f"Title: {stream_title}\n"
-        f"Started at: {started_text}\n"
-        f"{url}"
-    )
+#     sent_message = await channel.send(
+#         f"@everyone\n"
+#         f"🔴 **{TWITCH_USERNAME} is live!**\n"
+#         f"Playing: {category}\n"
+#         f"Title: {stream_title}\n"
+#         f"Started at: {started_text}\n"
+#         f"{url}"
+#     )
 
-    try:
-        await sent_message.publish()
-    except discord.Forbidden:
-        logger.error(f"Failed to publish announcement message in {channel.name} due to permissions.")
-    except discord.HTTPException as e:
-        logger.error(f"Failed to publish announcement message in {channel.name}. HTTPException: {e}")
+#     try:
+#         await sent_message.publish()
+#     except discord.Forbidden:
+#         logger.error(f"Failed to publish announcement message in {channel.name} due to permissions.")
+#     except discord.HTTPException as e:
+#         logger.error(f"Failed to publish announcement message in {channel.name}. HTTPException: {e}")
 
-    return web.Response(text="OK")
+#     return web.Response(text="OK")
 
 from twitch_stuff.live_check import twitch_is_live
 
@@ -1628,17 +1706,6 @@ async def new_category(interaction: discord.Interaction, category: str):
         ephemeral=False,
     )
 
-async def start_web_server():
-    app = web.Application()
-    app.router.add_post("/ifttt/twitch-live", handle_ifttt_live)
-
-    runner = web.AppRunner(app)
-    await runner.setup()
-
-    site = web.TCPSite(runner, "0.0.0.0", 8070)
-    await site.start()
-
-    print("Webhook server running on port 8070")
 
 if __name__ == '__main__':
     logger.debug("Starting bot")
